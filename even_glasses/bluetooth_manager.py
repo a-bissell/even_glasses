@@ -3,7 +3,8 @@ import logging
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from typing import Optional, Callable
-from even_glasses.models import DesiredConnectionState
+from even_glasses.models import DesiredConnectionState, Command
+import time
 
 from even_glasses.utils import construct_heartbeat
 from even_glasses.service_identifiers import (
@@ -142,7 +143,7 @@ class Glass(BleDevice):
         self.heartbeat_freq = heartbeat_freq
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.notification_handler: Optional[Callable[[int, bytes], None]] = None
-        
+        self.last_heartbeat = None
 
     async def start_heartbeat(self):
         if self.heartbeat_task is None or self.heartbeat_task.done():
@@ -172,9 +173,22 @@ class Glass(BleDevice):
         await super().disconnect()
     
     async def handle_notification(self, sender: int, data: bytes):
-        logger.info(f"Notification from {self.name}: {data.hex()}")
+        logger.debug(f"Raw notification from {self.name}: {data.hex()}")
+        
+        try:
+            # Check for heartbeat (Command.HEARTBEAT = 0x25)
+            if len(data) >= 6 and data[0] == Command.HEARTBEAT:
+                length = data[1] | (data[2] << 8)  # Next two bytes are length
+                if length == 6:  # Verify expected length
+                    self.last_heartbeat = time.time()
+                    logger.info(f"Valid heartbeat received from {self.name}")
+                else:
+                    logger.debug(f"Message with heartbeat command but wrong length: {data.hex()}")
+        except Exception as e:
+            logger.error(f"Error processing notification: {e}")
+        
         if self.notification_handler:
-            await self.notification_handler(self,sender, data)
+            await self.notification_handler(self, sender, data)
 
 
 class GlassesManager:
@@ -186,26 +200,36 @@ class GlassesManager:
         right_address: str = None,
         left_name: str = "G1 Left Glass",
         right_name: str = "G1 Right Glass",
+        log_callback=None,  # Add this parameter
     ):
-        self.left_glass: Optional[Glass] = (
+        self.left_glass = (
             Glass(name=left_name, address=left_address, side="left")
             if left_address
             else None
         )
-        self.right_glass: Optional[Glass] = (
+        self.right_glass = (
             Glass(name=right_name, address=right_address, side="right")
             if right_address
             else None
         )
+        self.log_callback = log_callback  # Store the callback
+
+    async def log(self, message: str):
+        """Log to both logger and UI if callback is available"""
+        logger.info(message)
+        if self.log_callback is not None:  # Add explicit check for None
+            try:
+                await self.log_callback(message)
+            except Exception as e:
+                logger.error(f"Error in log callback: {e}")
 
     async def scan_and_connect(self, timeout: int = 10) -> bool:
-        """Scan for glasses devices and connect to them."""
         try:
-            logger.info("Scanning for glasses devices...")
+            await self.log("Scanning for glasses devices...")
             devices = await BleakScanner.discover(timeout=timeout)
             for device in devices:
                 device_name = device.name or "Unknown"
-                logger.info(f"Found device: {device_name}, Address: {device.address}")
+                await self.log(f"Found device: {device_name}")
                 if "_L_" in device_name and not self.left_glass:
                     self.left_glass = Glass(name=device_name, address=device.address, side="left")
                 elif "_R_" in device_name and not self.right_glass:
@@ -220,13 +244,13 @@ class GlassesManager:
             if connect_tasks:
                 self.desired_connection_state = DesiredConnectionState.CONNECTED
                 await asyncio.gather(*connect_tasks)
-                logger.info("All glasses connected successfully.")
+                await self.log("All glasses connected successfully.")
                 return True
             else:
-                logger.error("No glasses devices found during scan.")
+                await self.log("No glasses devices found during scan.")
                 return False
         except Exception as e:
-            logger.error(f"Error during scan and connect: {e}")
+            await self.log(f"Error during scan and connect: {str(e)}")  # Add await here
             return False
 
     async def disconnect_all(self):
